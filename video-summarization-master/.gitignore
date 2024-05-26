@@ -1,0 +1,7 @@
+__pycache__
+.ipynb_checkpoints
+.DS_Store
+*.mp4
+*.ckpt
+
+interview-400010-8b8c33d4a88d.json
