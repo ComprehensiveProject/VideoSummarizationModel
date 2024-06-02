@@ -9,7 +9,7 @@ from flask_cors import CORS
 import torch
 from transformers import ViTImageProcessor, pipeline
 import cv2
-from moviepy.editor import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips, ImageSequenceClip
 import time
 import numpy as np
 from google.cloud import storage, speech_v1p1beta1 as speech
@@ -19,8 +19,11 @@ from konlpy.tag import Okt
 from gensim import corpora, models
 import moviepy.editor as mp
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering
 import re
+import tempfile
+import kss
+import dlib
 
 from v2021 import SummaryModel
 
@@ -171,6 +174,223 @@ def summarize():
 # def get_progress():
 #     progress = progress_dict.get('progress', 0)
 #     return jsonify({"progress": progress})
+
+def extract_audio(video_file):
+    video = VideoFileClip(video_file)
+    audio_file = video_file.replace('.mp4', '.wav')
+    video.audio.write_audiofile(audio_file)
+    return audio_file
+
+def audio_to_text(audio_file):
+    recognizer = sr.Recognizer()
+    audio = AudioSegment.from_file(audio_file)
+    audio = audio.set_channels(1)
+    audio.export("temp.wav", format="wav")
+
+    with sr.AudioFile("temp.wav") as source:
+        audio_data = recognizer.record(source)
+
+    client = speech.SpeechClient()
+    sample_rate = audio.frame_rate
+    chunks = [audio[i:i + 10000] for i in range(0, len(audio), 10000)]
+    transcript = ""
+
+    for i, chunk in enumerate(chunks):
+        chunk.export(f"chunk{i}.wav", format="wav")
+        with open(f"chunk{i}.wav", "rb") as audio_file:
+            content = audio_file.read()
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=sample_rate,
+            language_code="ko-KR",
+        )
+        response = client.recognize(config=config, audio=audio)
+        transcript += "".join([result.alternatives[0].transcript for result in response.results])
+        os.remove(f"chunk{i}.wav")
+
+    os.remove("temp.wav")
+    return transcript
+
+def preprocess_text(text):
+    processed_text = re.sub(r'[^가-힣\s]', '', text)
+    sentences = kss.split_sentences(processed_text)
+    return [sentence.strip() for sentence in sentences if sentence.strip()]
+
+def extract_topics_and_summarize(sentences, num_topics=5):
+    if not sentences or len(sentences) < 2:
+        return {"error": "Not enough data to extract topics. Please provide more text."}
+
+    model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+    sentence_embeddings = model.encode(sentences)
+    num_topics = min(num_topics, len(sentences))
+    clustering_model = AgglomerativeClustering(n_clusters=num_topics)
+    clustering_model.fit(sentence_embeddings)
+    cluster_assignment = clustering_model.labels_
+
+    clustered_sentences = {i: [] for i in range(num_topics)}
+    for sentence_id, cluster_id in enumerate(cluster_assignment):
+        clustered_sentences[cluster_id].append(sentences[sentence_id])
+
+    summarizer = pipeline("summarization", model="gogamza/kobart-base-v2", tokenizer="gogamza/kobart-base-v2")
+    topic_sentences = {}
+    for i, sentences in clustered_sentences.items():
+        combined_text = ' '.join(sentences)
+        if len(combined_text.split()) > 50:
+            summary = summarizer(combined_text, max_length=50, min_length=25, do_sample=False)[0]['summary_text']
+        else:
+            summary = combined_text
+        topic_sentences[f'주제 {i+1}'] = summary
+
+    return topic_sentences
+
+def find_relevant_sentences(sentences, topic_summary, max_duration=60):
+    okt = Okt()
+    topic_nouns = okt.nouns(topic_summary)
+    relevant_sentences = [sentence for sentence in sentences if any(noun in sentence for noun in topic_nouns)]
+
+    if not relevant_sentences:
+        return [], 0
+
+    total_duration = 0
+    relevant_text = []
+
+    for sentence in relevant_sentences:
+        duration = len(sentence.split()) / 2.5
+        if total_duration + duration > max_duration:
+            break
+        relevant_text.append(sentence)
+        total_duration += duration
+
+    return relevant_text, total_duration
+
+def extract_important_frames(video_file, start_time, end_time, sample_every_sec=2):
+    detector = dlib.get_frontal_face_detector()
+    cap = cv2.VideoCapture(video_file)
+    frames = []
+    timestamps = []
+    face_centers = []
+
+    frame_count = 0
+    total_frames = int((end_time - start_time) * cap.get(cv2.CAP_PROP_FPS))
+    cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        if timestamp > end_time:
+            break
+        if int(timestamp - start_time) % sample_every_sec == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = detector(gray)
+            if faces:
+                face = faces[0]
+                center_x = (face.left() + face.right()) // 2
+                face_centers.append(center_x)
+            else:
+                face_centers.append(frame.shape[1] // 2)
+            frames.append(frame)
+            timestamps.append(timestamp)
+            del frame
+            frame_count += 1
+    cap.release()
+
+    return timestamps, face_centers
+
+def cut_video_with_focus(video_file, start_time, end_time, output_file, focus_frames):
+    video = VideoFileClip(video_file).subclip(start_time, end_time)
+    target_height = 720
+    video = video.resize(height=target_height)
+
+    def crop_center(image, center_x):
+        height, width, _ = image.shape
+        new_width = int(height * 9 / 16)
+        left = max(0, min(center_x - new_width // 2, width - new_width))
+        cropped_image = image[:, left:left + new_width]
+        return cropped_image
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        frame_files = []
+
+        for t, frame in enumerate(video.iter_frames()):
+            idx = int((t / len(focus_frames)) * len(focus_frames))
+            idx = min(idx, len(focus_frames) - 1)
+            center_x = focus_frames[idx]
+            cropped_frame = crop_center(frame, center_x)
+            frame_file = os.path.join(temp_dir, f"frame_{t:04d}.png")
+            try:
+                cv2.imwrite(frame_file, cv2.cvtColor(cropped_frame, cv2.COLOR_RGB2BGR))
+                if os.path.exists(frame_file):
+                    frame_files.append(frame_file)
+            except Exception as e:
+                print(f"Error saving frame {t}: {e}")
+
+        if not frame_files:
+            return
+
+        new_clip = ImageSequenceClip(frame_files, fps=video.fps)
+        audio = video.audio
+        new_clip = new_clip.set_audio(audio)
+        new_clip.write_videofile(output_file, codec='libx264', audio_codec='aac')
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+
+    file = request.files['file']
+    file_path = os.path.join("uploads", file.filename)
+    file.save(file_path)
+
+    try:
+        audio_file = extract_audio(file_path)
+        transcript = audio_to_text(audio_file)
+        processed_text = preprocess_text(transcript)
+        topics = extract_topics_and_summarize(processed_text)
+
+        return jsonify({"topics": topics}), 200
+    except Exception as e:
+        logger.error(f"Error during topic extraction: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/cut', methods=['POST'])
+def cut():
+    if 'file' not in request.files or 'selectedTopic' not in request.form:
+        return jsonify({"error": "No file or selected topic"}), 400
+
+    file = request.files['file']
+    selected_topic = request.form['selectedTopic']
+    file_path = os.path.join("uploads", file.filename)
+    file.save(file_path)
+
+    try:
+        audio_file = extract_audio(file_path)
+        transcript = audio_to_text(audio_file)
+        processed_text = preprocess_text(transcript)
+
+        relevant_sentences, duration = find_relevant_sentences(processed_text, selected_topic)
+        if not relevant_sentences:
+            raise ValueError(f"Selected topic '{selected_topic}' has no relevant sentences.")
+
+        start_time = 0
+        end_time = start_time + duration
+        timestamps, face_centers = extract_important_frames(file_path, start_time, end_time)
+        focus_frame_index = np.argmax(face_centers)
+        focus_frame = face_centers[focus_frame_index]
+
+        output_file = 'videos/shorts_output.mp4'
+        cut_video_with_focus(file_path, start_time, end_time, output_file, face_centers)
+
+        gcs_url = upload_to_gcs(output_file, f"shorts/{os.path.basename(output_file)}")
+        os.remove(output_file)
+
+        return jsonify({"video_url": gcs_url}), 200
+    except Exception as e:
+        logger.error(f"Error during video processing: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     if not os.path.exists("uploads"):
