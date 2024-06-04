@@ -20,6 +20,8 @@ from gensim import corpora, models
 import moviepy.editor as mp
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
+from tqdm import tqdm
 import re
 import tempfile
 import kss
@@ -90,6 +92,18 @@ def summarize_video(video_path, summary_time):
             last_collected = second
             frames.append(frame)
 
+        # 메모리 해제
+        del frame
+
+    cap.release()
+
+    # 메모리 확보
+    import gc
+    gc.collect()
+
+    if not frames:
+        return None
+
     features = preprocessor(images=frames, return_tensors="pt")["pixel_values"]
     model = SummaryModel.load_from_checkpoint('summary.ckpt')
     model.eval()
@@ -133,42 +147,6 @@ def summarize_video(video_path, summary_time):
         return gcs_url
     else:
         return None
-
-# 영상 요약 실행
-@app.route('/summarize', methods=['POST'])
-def summarize():
-    logger.info("Received request at /summarize")
-    if 'file' not in request.files or 'summaryTime' not in request.form:
-        return jsonify({"error": "No file part or summary time"}), 400
-
-    file = request.files['file']
-    summary_time = int(request.form['summaryTime'])
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-
-    file_path = os.path.join("uploads", file.filename)
-    file.save(file_path)
-
-    # # Initialize progress
-    # update_progress(0)
-    #
-    # for i in range(1, 11):
-    #     time.sleep(1)  # Simulate time-consuming task
-    #     update_progress(i * 10)
-
-    try:
-        logger.info("Starting video summarization process")
-        result_path = summarize_video(file_path, summary_time)
-        logger.info("Video summarization process completed")
-
-        if result_path:
-            return jsonify({"result_path": result_path}), 200
-        else:
-            logger.error("No suitable clips found")
-            return jsonify({"error": "No suitable clips found"}), 500
-    except Exception as e:
-        logger.error(f"Error during summarization: {str(e)}")
-        return jsonify({"error": str(e)}), 500
 
 # @app.route('/progress', methods=['GET'])
 # def get_progress():
@@ -217,32 +195,50 @@ def preprocess_text(text):
     sentences = kss.split_sentences(processed_text)
     return [sentence.strip() for sentence in sentences if sentence.strip()]
 
-def extract_topics_and_summarize(sentences, num_topics=5):
+def extract_topics_and_summarize(sentences, max_topics=5):
     if not sentences or len(sentences) < 2:
         return {"error": "Not enough data to extract topics. Please provide more text."}
 
-    model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+    # 문장 임베딩 모델 로드
+    model = SentenceTransformer('sentence-transformers/xlm-r-100langs-bert-base-nli-stsb-mean-tokens')
     sentence_embeddings = model.encode(sentences)
-    num_topics = min(num_topics, len(sentences))
-    clustering_model = AgglomerativeClustering(n_clusters=num_topics)
+
+    # 최적의 클러스터 개수 결정
+    optimal_num_clusters = find_optimal_clusters(sentence_embeddings, max_topics)
+
+    # 최적의 클러스터 개수를 사용하여 AgglomerativeClustering 수행
+    clustering_model = AgglomerativeClustering(n_clusters=optimal_num_clusters)
     clustering_model.fit(sentence_embeddings)
     cluster_assignment = clustering_model.labels_
 
-    clustered_sentences = {i: [] for i in range(num_topics)}
+    # 클러스터별로 문장 그룹화
+    clustered_sentences = {i: [] for i in range(optimal_num_clusters)}
     for sentence_id, cluster_id in enumerate(cluster_assignment):
         clustered_sentences[cluster_id].append(sentences[sentence_id])
 
+    # 각 클러스터에 대해 요약 수행
     summarizer = pipeline("summarization", model="gogamza/kobart-base-v2", tokenizer="gogamza/kobart-base-v2")
     topic_sentences = {}
     for i, sentences in clustered_sentences.items():
         combined_text = ' '.join(sentences)
-        if len(combined_text.split()) > 50:
-            summary = summarizer(combined_text, max_length=50, min_length=25, do_sample=False)[0]['summary_text']
+        if len(combined_text.split()) > 50:  # Summarize only if more than 50 words
+            summary = summarizer(combined_text, max_length=50, min_length=20, do_sample=False)[0]['summary_text']
         else:
             summary = combined_text
         topic_sentences[f'주제 {i+1}'] = summary
 
     return topic_sentences
+
+# 최적의 주제 개수를 결정하는 함수
+def find_optimal_clusters(embeddings, max_clusters=5):
+    scores = []
+    for num_clusters in range(2, max_clusters + 1):
+        clustering_model = AgglomerativeClustering(n_clusters=num_clusters)
+        cluster_labels = clustering_model.fit_predict(embeddings)
+        score = silhouette_score(embeddings, cluster_labels)
+        scores.append((num_clusters, score))
+    optimal_num_clusters = max(scores, key=lambda item: item[1])[0]
+    return optimal_num_clusters
 
 def find_relevant_sentences(sentences, topic_summary, max_duration=60):
     okt = Okt()
@@ -264,7 +260,7 @@ def find_relevant_sentences(sentences, topic_summary, max_duration=60):
 
     return relevant_text, total_duration
 
-def extract_important_frames(video_file, start_time, end_time, sample_every_sec=2):
+def extract_important_frames(video_file, start_time, end_time, sample_every_sec=5):
     detector = dlib.get_frontal_face_detector()
     cap = cv2.VideoCapture(video_file)
     frames = []
@@ -275,26 +271,31 @@ def extract_important_frames(video_file, start_time, end_time, sample_every_sec=
     total_frames = int((end_time - start_time) * cap.get(cv2.CAP_PROP_FPS))
     cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        if timestamp > end_time:
-            break
-        if int(timestamp - start_time) % sample_every_sec == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = detector(gray)
-            if faces:
-                face = faces[0]
-                center_x = (face.left() + face.right()) // 2
-                face_centers.append(center_x)
-            else:
-                face_centers.append(frame.shape[1] // 2)
-            frames.append(frame)
-            timestamps.append(timestamp)
-            del frame
-            frame_count += 1
+    with tqdm(total=total_frames // sample_every_sec) as pbar:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if timestamp > end_time:
+                break
+            if int(timestamp - start_time) % sample_every_sec == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = detector(gray)
+                if faces:
+                    face = faces[0]
+                    center_x = (face.left() + face.right()) // 2
+                    face_centers.append(center_x)
+                else:
+                    face_centers.append(frame.shape[1] // 2)  # 얼굴을 찾지 못한 경우 중앙을 중심으로 설정
+                frames.append(frame)
+                timestamps.append(timestamp)
+                # 메모리 해제
+                del frame
+                frame_count += 1
+                pbar.update(1)
+                if frame_count % 50 == 0:  # 메모리 해제 빈도를 조정
+                    cv2.waitKey(1)
     cap.release()
 
     return timestamps, face_centers
@@ -334,6 +335,42 @@ def cut_video_with_focus(video_file, start_time, end_time, output_file, focus_fr
         audio = video.audio
         new_clip = new_clip.set_audio(audio)
         new_clip.write_videofile(output_file, codec='libx264', audio_codec='aac')
+
+# 영상 요약 실행
+@app.route('/summarize', methods=['POST'])
+def summarize():
+    logger.info("Received request at /summarize")
+    if 'file' not in request.files or 'summaryTime' not in request.form:
+        return jsonify({"error": "No file part or summary time"}), 400
+
+    file = request.files['file']
+    summary_time = int(request.form['summaryTime'])
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    file_path = os.path.join("uploads", file.filename)
+    file.save(file_path)
+
+    # # Initialize progress
+    # update_progress(0)
+    #
+    # for i in range(1, 11):
+    #     time.sleep(1)  # Simulate time-consuming task
+    #     update_progress(i * 10)
+
+    try:
+        logger.info("Starting video summarization process")
+        result_path = summarize_video(file_path, summary_time)
+        logger.info("Video summarization process completed")
+
+        if result_path:
+            return jsonify({"result_path": result_path}), 200
+        else:
+            logger.error("No suitable clips found")
+            return jsonify({"error": "No suitable clips found"}), 500
+    except Exception as e:
+        logger.error(f"Error during summarization: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -389,6 +426,124 @@ def cut():
         return jsonify({"video_url": gcs_url}), 200
     except Exception as e:
         logger.error(f"Error during video processing: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def extract_top_clips(video_path, top_n=3, max_duration=60):
+    logger.info("Loading video for top clips extraction")
+    preprocessor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224", size=224)
+
+    SAMPLE_EVERY_SEC = 2
+
+    cap = cv2.VideoCapture(video_path)
+    n_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    video_len = n_frames / fps
+
+    logger.info(f"Video length (seconds): {video_len}")
+
+    frames = []
+    last_collected = -1
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        timestamp = cap.get(cv2.CAP_PROP_POS_MSEC)
+        second = timestamp // 1000
+
+        if second % SAMPLE_EVERY_SEC == 0 and second != last_collected:
+            last_collected = second
+            frames.append(frame)
+
+        # 메모리 해제
+        del frame
+
+    cap.release()
+
+    # 메모리 확보
+    import gc
+    gc.collect()
+
+    if not frames:
+        return None
+
+    features = preprocessor(images=frames, return_tensors="pt")["pixel_values"]
+    model = SummaryModel.load_from_checkpoint('summary.ckpt')
+    model.eval()
+
+    y_pred = []
+    for frame in features:
+        y_p = model(frame.unsqueeze(0))
+        y_p = torch.sigmoid(y_p)
+        y_pred.append(y_p.detach().numpy().squeeze())
+    y_pred = np.array(y_pred)
+
+    clip = VideoFileClip(video_path)
+    top_indices = np.argsort(y_pred)[-top_n:]  # 가장 중요한 상위 n개 프레임의 인덱스
+
+    # Top n 클립 생성 및 저장
+    output_urls = []
+    for i, idx in enumerate(top_indices[::-1]):
+        start_sec = max(0, idx * SAMPLE_EVERY_SEC - max_duration // 2)
+        end_sec = min(clip.duration, start_sec + max_duration)
+        selected_clip = clip.subclip(start_sec, end_sec)
+
+        # 세로 영상으로 변환
+        width, height = selected_clip.size
+        new_width = int(height * 9 / 16)  # 16:9 비율 유지
+
+        if new_width >= width:
+            pad_width = (new_width - width) // 2
+            vertical_clip = selected_clip.margin(left=pad_width, right=pad_width, color=(0, 0, 0))
+        else:
+            new_height = int(width * 16 / 9)
+            pad_height = (new_height - height) // 2
+            vertical_clip = selected_clip.margin(top=pad_height, bottom=pad_height, color=(0, 0, 0))
+            vertical_clip = vertical_clip.resize(height=new_height)
+
+        # frame rate 설정
+        fps = clip.fps
+
+        final_output = f"videos/sport_final_result_vertical_top{i+1}.mp4"
+        vertical_clip.write_videofile(final_output, fps=fps, codec='libx264', audio_codec='aac')
+
+        # GCS에 업로드하고 URL 반환
+        gcs_url = upload_to_gcs(final_output, f"summaries/{os.path.basename(final_output)}")
+        output_urls.append(gcs_url)
+
+        # 로컬 파일 삭제
+        os.remove(final_output)
+
+    return output_urls
+
+@app.route('/extract_top_clips', methods=['POST'])
+def extract_top_clips_endpoint():
+    logger.info("Received request at /extract_top_clips")
+    if 'file' not in request.files or 'topN' not in request.form:
+        return jsonify({"error": "No file part or topN"}), 400
+
+    file = request.files['file']
+    top_n = int(request.form['topN'])
+    summary_time = 60  # 60초로 고정
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    file_path = os.path.join("uploads", file.filename)
+    file.save(file_path)
+
+    try:
+        logger.info("Starting top clips extraction process")
+        result_paths = extract_top_clips(file_path, top_n, summary_time)
+        logger.info("Top clips extraction process completed")
+
+        if result_paths:
+            return jsonify({"result_paths": result_paths}), 200
+        else:
+            logger.error("No suitable clips found")
+            return jsonify({"error": "No suitable clips found"}), 500
+    except Exception as e:
+        logger.error(f"Error during top clips extraction: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 
