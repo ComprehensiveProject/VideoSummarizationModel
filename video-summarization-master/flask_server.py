@@ -69,6 +69,7 @@ def summarize_video(video_path, summary_time):
     preprocessor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224", size=224)
 
     SAMPLE_EVERY_SEC = 2
+    update_progress(10)
 
     cap = cv2.VideoCapture(video_path)
     n_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -101,12 +102,16 @@ def summarize_video(video_path, summary_time):
     import gc
     gc.collect()
 
+    update_progress(30)
+
     if not frames:
         return None
 
     features = preprocessor(images=frames, return_tensors="pt")["pixel_values"]
     model = SummaryModel.load_from_checkpoint('summary.ckpt')
     model.eval()
+
+    update_progress(40)
 
     y_pred = []
     for frame in features:
@@ -120,6 +125,8 @@ def summarize_video(video_path, summary_time):
     sorted_indices = np.argsort(-y_pred)
     selected_clips = []
     total_duration = 0
+
+    update_progress(60)
 
     for idx in sorted_indices:
         sec = idx * SAMPLE_EVERY_SEC
@@ -138,20 +145,24 @@ def summarize_video(video_path, summary_time):
         result_path = "videos/summary_result.mp4"
         summarized_clip.write_videofile(result_path, codec='libx264', audio_codec='aac')
 
+        update_progress(90)
+
         # GCS에 업로드하고 URL 반환
         gcs_url = upload_to_gcs(result_path, f"summaries/{os.path.basename(result_path)}")
 
         # 로컬 파일 삭제
         os.remove(result_path)
 
+        update_progress(100)
+
         return gcs_url
     else:
         return None
 
-# @app.route('/progress', methods=['GET'])
-# def get_progress():
-#     progress = progress_dict.get('progress', 0)
-#     return jsonify({"progress": progress})
+@app.route('/progress', methods=['GET'])
+def get_progress():
+    progress = progress_dict.get('progress', 0)
+    return jsonify({"progress": progress})
 
 def extract_audio(video_file):
     video = VideoFileClip(video_file)
@@ -351,19 +362,13 @@ def summarize():
     file_path = os.path.join("uploads", file.filename)
     file.save(file_path)
 
-    # # Initialize progress
-    # update_progress(0)
-    #
-    # for i in range(1, 11):
-    #     time.sleep(1)  # Simulate time-consuming task
-    #     update_progress(i * 10)
-
     try:
         logger.info("Starting video summarization process")
         result_path = summarize_video(file_path, summary_time)
         logger.info("Video summarization process completed")
 
         if result_path:
+            update_progress(0)
             return jsonify({"result_path": result_path}), 200
         else:
             logger.error("No suitable clips found")
@@ -380,12 +385,19 @@ def upload():
     file = request.files['file']
     file_path = os.path.join("uploads", file.filename)
     file.save(file_path)
+    update_progress(10)
 
     try:
         audio_file = extract_audio(file_path)
+        update_progress(20)
         transcript = audio_to_text(audio_file)
+        update_progress(50)
         processed_text = preprocess_text(transcript)
+        update_progress(80)
         topics = extract_topics_and_summarize(processed_text)
+
+        update_progress(100)
+        update_progress(0)
 
         return jsonify({"topics": topics}), 200
     except Exception as e:
@@ -401,13 +413,18 @@ def cut():
     selected_topic = request.form['selectedTopic']
     file_path = os.path.join("uploads", file.filename)
     file.save(file_path)
+    update_progress(10)
 
     try:
         audio_file = extract_audio(file_path)
+        update_progress(20)
         transcript = audio_to_text(audio_file)
+        update_progress(30)
         processed_text = preprocess_text(transcript)
+        update_progress(50)
 
         relevant_sentences, duration = find_relevant_sentences(processed_text, selected_topic)
+        update_progress(70)
         if not relevant_sentences:
             raise ValueError(f"Selected topic '{selected_topic}' has no relevant sentences.")
 
@@ -419,133 +436,113 @@ def cut():
 
         output_file = 'videos/shorts_output.mp4'
         cut_video_with_focus(file_path, start_time, end_time, output_file, face_centers)
+        update_progress(90)
 
         gcs_url = upload_to_gcs(output_file, f"shorts/{os.path.basename(output_file)}")
         os.remove(output_file)
+
+        update_progress(100)
+        update_progress(0)
 
         return jsonify({"video_url": gcs_url}), 200
     except Exception as e:
         logger.error(f"Error during video processing: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-def extract_top_clips(video_path, top_n=3, max_duration=60):
-    logger.info("Loading video for top clips extraction")
-    preprocessor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224", size=224)
 
-    SAMPLE_EVERY_SEC = 2
+def find_loudest_sections(video_path, sample_rate=1, top_n=3):
+    video = mp.VideoFileClip(video_path)
+    audio_path = "temp_audio.wav"
+    video.audio.write_audiofile(audio_path)
 
-    cap = cv2.VideoCapture(video_path)
-    n_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    video_len = n_frames / fps
+    audio = AudioSegment.from_wav(audio_path)
+    os.remove(audio_path)
 
-    logger.info(f"Video length (seconds): {video_len}")
+    update_progress(40)
 
-    frames = []
-    last_collected = -1
+    loudness = [audio[i * 1000:(i + 1) * 1000].dBFS for i in range(int(audio.duration_seconds))]
+    loudness = np.array(loudness)
+    sample_every_sec = sample_rate
+    loudness = loudness[::sample_every_sec]
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    update_progress(50)
 
-        timestamp = cap.get(cv2.CAP_PROP_POS_MSEC)
-        second = timestamp // 1000
+    loudest_indices = np.argsort(loudness)[-top_n:][::-1]
+    return video, loudest_indices
 
-        if second % SAMPLE_EVERY_SEC == 0 and second != last_collected:
-            last_collected = second
-            frames.append(frame)
+def create_vertical_clip(video, idx, max_duration=50):
+    start_sec = max(0, idx * 1 - max_duration // 2)
+    end_sec = min(video.duration, start_sec + max_duration)
+    selected_clip = video.subclip(start_sec, end_sec)
 
-        # 메모리 해제
-        del frame
+    width, height = selected_clip.size
+    new_width = int(height * 9 / 16)
 
-    cap.release()
+    if new_width >= width:
+        pad_width = (new_width - width) // 2
+        vertical_clip = selected_clip.margin(left=pad_width, right=pad_width, color=(0, 0, 0))
+    else:
+        new_height = int(width * 16 / 9)
+        pad_height = (new_height - height) // 2
+        vertical_clip = selected_clip.margin(top=pad_height, bottom=pad_height, color=(0, 0, 0))
+        vertical_clip = vertical_clip.resize(height=new_height)
 
-    # 메모리 확보
-    import gc
-    gc.collect()
+    update_progress(70)
 
-    if not frames:
-        return None
+    return vertical_clip
 
-    features = preprocessor(images=frames, return_tensors="pt")["pixel_values"]
-    model = SummaryModel.load_from_checkpoint('summary.ckpt')
-    model.eval()
+def save_clips(clips, output_dir="videos"):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    y_pred = []
-    for frame in features:
-        y_p = model(frame.unsqueeze(0))
-        y_p = torch.sigmoid(y_p)
-        y_pred.append(y_p.detach().numpy().squeeze())
-    y_pred = np.array(y_pred)
-
-    clip = VideoFileClip(video_path)
-    top_indices = np.argsort(y_pred)[-top_n:]  # 가장 중요한 상위 n개 프레임의 인덱스
-
-    # Top n 클립 생성 및 저장
-    output_urls = []
-    for i, idx in enumerate(top_indices[::-1]):
-        start_sec = max(0, idx * SAMPLE_EVERY_SEC - max_duration // 2)
-        end_sec = min(clip.duration, start_sec + max_duration)
-        selected_clip = clip.subclip(start_sec, end_sec)
-
-        # 세로 영상으로 변환
-        width, height = selected_clip.size
-        new_width = int(height * 9 / 16)  # 16:9 비율 유지
-
-        if new_width >= width:
-            pad_width = (new_width - width) // 2
-            vertical_clip = selected_clip.margin(left=pad_width, right=pad_width, color=(0, 0, 0))
-        else:
-            new_height = int(width * 16 / 9)
-            pad_height = (new_height - height) // 2
-            vertical_clip = selected_clip.margin(top=pad_height, bottom=pad_height, color=(0, 0, 0))
-            vertical_clip = vertical_clip.resize(height=new_height)
-
-        # frame rate 설정
+    output_paths = []
+    for i, clip in enumerate(tqdm(clips, desc="Saving clips")):
+        final_output = f"{output_dir}/sport_final_result_vertical_top{i + 1}.mp4"
         fps = clip.fps
-
-        final_output = f"videos/sport_final_result_vertical_top{i+1}.mp4"
-        vertical_clip.write_videofile(final_output, fps=fps, codec='libx264', audio_codec='aac')
+        clip.write_videofile(final_output, fps=fps, codec='libx264', audio_codec='aac')
 
         # GCS에 업로드하고 URL 반환
         gcs_url = upload_to_gcs(final_output, f"summaries/{os.path.basename(final_output)}")
-        output_urls.append(gcs_url)
+        output_paths.append(gcs_url)
+
+        update_progress(90)
 
         # 로컬 파일 삭제
         os.remove(final_output)
 
-    return output_urls
+    return output_paths
 
-@app.route('/extract_top_clips', methods=['POST'])
-def extract_top_clips_endpoint():
-    logger.info("Received request at /extract_top_clips")
+@app.route('/sports_top_clips', methods=['POST'])
+def sports_top_clips_endpoint():
     if 'file' not in request.files or 'topN' not in request.form:
         return jsonify({"error": "No file part or topN"}), 400
 
+    update_progress(10)
+
     file = request.files['file']
     top_n = int(request.form['topN'])
-    summary_time = 60  # 60초로 고정
+    summary_time = 50  # 클립의 최대 길이를 50초로 고정
+
+    update_progress(20)
+
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
 
     file_path = os.path.join("uploads", file.filename)
     file.save(file_path)
 
+    update_progress(30)
+
     try:
-        logger.info("Starting top clips extraction process")
-        result_paths = extract_top_clips(file_path, top_n, summary_time)
-        logger.info("Top clips extraction process completed")
+        video, loudest_indices = find_loudest_sections(file_path, top_n=top_n)
+        clips = [create_vertical_clip(video, idx, max_duration=summary_time) for idx in loudest_indices]
+        result_paths = save_clips(clips)
 
-        if result_paths:
-            return jsonify({"result_paths": result_paths}), 200
-        else:
-            logger.error("No suitable clips found")
-            return jsonify({"error": "No suitable clips found"}), 500
+        update_progress(100)
+        update_progress(0)
+        return jsonify({"result_paths": result_paths}), 200
     except Exception as e:
-        logger.error(f"Error during top clips extraction: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == '__main__':
     if not os.path.exists("uploads"):
