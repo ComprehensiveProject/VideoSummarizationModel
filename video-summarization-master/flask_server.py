@@ -26,6 +26,7 @@ import re
 import tempfile
 import kss
 import dlib
+import gc
 
 from v2021 import SummaryModel
 
@@ -91,7 +92,8 @@ def summarize_video(video_path, summary_time):
 
         if second % SAMPLE_EVERY_SEC == 0 and second != last_collected:
             last_collected = second
-            frames.append(frame)
+            resized_frame = cv2.resize(frame, (224, 224))  # 해상도 낮추기
+            frames.append(resized_frame)
 
         # 메모리 해제
         del frame
@@ -99,7 +101,6 @@ def summarize_video(video_path, summary_time):
     cap.release()
 
     # 메모리 확보
-    import gc
     gc.collect()
 
     update_progress(30)
@@ -143,7 +144,7 @@ def summarize_video(video_path, summary_time):
     if subclips:
         summarized_clip = concatenate_videoclips(subclips, method="compose")
         result_path = "videos/summary_result.mp4"
-        summarized_clip.write_videofile(result_path, codec='libx264', audio_codec='aac')
+        summarized_clip.write_videofile(result_path, codec='libx264', audio_codec='aac', bitrate='500k', fps=24, preset='ultrafast')
 
         update_progress(90)
 
@@ -345,7 +346,7 @@ def cut_video_with_focus(video_file, start_time, end_time, output_file, focus_fr
         new_clip = ImageSequenceClip(frame_files, fps=video.fps)
         audio = video.audio
         new_clip = new_clip.set_audio(audio)
-        new_clip.write_videofile(output_file, codec='libx264', audio_codec='aac')
+        new_clip.write_videofile(output_file, codec='libx264', audio_codec='aac', bitrate='500k', fps=24, preset='ultrafast')
 
 # 영상 요약 실행
 @app.route('/summarize', methods=['POST'])
@@ -499,7 +500,7 @@ def save_clips(clips, output_dir="videos"):
     for i, clip in enumerate(tqdm(clips, desc="Saving clips")):
         final_output = f"{output_dir}/sport_final_result_vertical_top{i + 1}.mp4"
         fps = clip.fps
-        clip.write_videofile(final_output, fps=fps, codec='libx264', audio_codec='aac')
+        clip.write_videofile(final_output, fps=fps, codec='libx264', audio_codec='aac', bitrate='500k', preset='ultrafast')
 
         # GCS에 업로드하고 URL 반환
         gcs_url = upload_to_gcs(final_output, f"summaries/{os.path.basename(final_output)}")
